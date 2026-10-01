@@ -1,660 +1,461 @@
-/**
- * CENTRAL-HEX - Bot WhatsApp Multifonctions
- * Développé par CENTRAL-HEX
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the MIT License.
- * Baileys Library by @adiwajshing
- */
-require('dotenv').config();
-require('./settings')
-const { Boom } = require('@hapi/boom')
-const fs = require('fs')
-const chalk = require('chalk')
-const FileType = require('file-type')
-const path = require('path')
-const axios = require('axios')
-const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main');
-const PhoneNumber = require('awesome-phonenumber')
-const { imageToWebp, videoToWebp, writeExifImg, writeExifVid } = require('./lib/exif')
-const { smsg, isUrl, generateMessageTag, getBuffer, getSizeMedia, fetch, sleep, reSize } = require('./lib/myfunc')
-const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    DisconnectReason,
-    fetchLatestBaileysVersion,
-    generateForwardMessageContent,
-    prepareWAMessageMedia,
-    generateWAMessageFromContent,
-    generateMessageID,
-    downloadContentFromMessage,
-    jidDecode,
-    proto,
-    jidNormalizedUser,
-    makeCacheableSignalKeyStore,
-    Browsers,
-    delay
-} = require("@whiskeysockets/baileys")
-const NodeCache = require("node-cache")
-// Using a lightweight persisted store instead of makeInMemoryStore (compat across versions)
-const pino = require("pino")
-const readline = require("readline")
-const { parsePhoneNumber } = require("libphonenumber-js")
-const { PHONENUMBER_MCC } = require('@whiskeysockets/baileys/lib/Utils/generics')
-const { rmSync, existsSync } = require('fs')
-const { join } = require('path')
+const fs = require('fs');
+const path = require('path');
 
-// Import lightweight store
-const store = require('./lib/lightweight_store')
-
-// Initialize store
-store.readFromFile()
-const settings = require('./settings')
-setInterval(() => store.writeToFile(), settings.storeWriteInterval || 10000)
-
-// Memory optimization - Force garbage collection if available
-setInterval(() => {
-    if (global.gc) {
-        global.gc()
-        console.log('🧹 Garbage collection completed')
-    }
-}, 60_000) // every 1 minute
-
-// Memory monitoring - Restart if RAM gets too high
-setInterval(() => {
-    const used = process.memoryUsage().rss / 1024 / 1024
-    if (used > 400) {
-        console.log('⚠️ RAM too high (>400MB), restarting bot...')
-        process.exit(1) // Panel will auto-restart
-    }
-}, 30_000) // check every 30 seconds
-
-let phoneNumber = settings.ownerNumber || process.env.OWNER_NUMBER || ""
-let owner = JSON.parse(fs.readFileSync('./data/owner.json'))
-
-global.botname = "CENTRAL-HEX"
-global.themeemoji = "•"
-const pairingCode = true // ✦ SATORU-MD : toujours pairing code, jamais de QR
-const useMobile = process.argv.includes("--mobile")
-
-// Only create readline interface if we're in an interactive environment
-const rl = process.stdin.isTTY ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null
-const question = (text) => {
-    if (rl) {
-        return new Promise((resolve) => rl.question(text, resolve))
-    } else {
-        // In non-interactive environment, use ownerNumber from settings
-        return Promise.resolve(settings.ownerNumber || phoneNumber)
-    }
-}
-
-
-async function startXeonBotInc() {
+// Function to load user and group data from JSON file
+function loadUserGroupData() {
     try {
-        let { version, isLatest } = await fetchLatestBaileysVersion()
-        const { state, saveCreds } = await useMultiFileAuthState(`./session`)
-        const msgRetryCounterCache = new NodeCache()
-
-        const XeonBotInc = makeWASocket({
-            version,
-            logger: pino({ level: 'silent' }),
-            printQRInTerminal: !pairingCode,
-            browser: Browsers.ubuntu('Chrome'),
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
-            },
-            markOnlineOnConnect: true,
-            generateHighQualityLinkPreview: true,
-            syncFullHistory: false,
-            getMessage: async (key) => {
-                let jid = jidNormalizedUser(key.remoteJid)
-                let msg = await store.loadMessage(jid, key.id)
-                return msg?.message || ""
-            },
-            msgRetryCounterCache,
-            defaultQueryTimeoutMs: 60000,
-            connectTimeoutMs: 60000,
-            keepAliveIntervalMs: 10000,
-        })
-
-        // Save credentials when they update
-        XeonBotInc.ev.on('creds.update', saveCreds)
-
-    store.bind(XeonBotInc.ev)
-
-    // Message handling
-    XeonBotInc.ev.on('messages.upsert', async chatUpdate => {
-        try {
-            const mek = chatUpdate.messages[0]
-            if (!mek.message) return
-            mek.message = (Object.keys(mek.message)[0] === 'ephemeralMessage') ? mek.message.ephemeralMessage.message : mek.message
-            // Gérer les statuts
-            if (mek.key && mek.key.remoteJid === 'status@broadcast') {
-                await handleStatus(XeonBotInc, chatUpdate);
-                return;
-            }
-
-            // ── ANTI-MENTION STATUT : intercepter groupMentionedMessage ──
-            // Ces messages arrivent dans les GROUPES (pas status@broadcast)
-            // Baileys les envoie comme messages normaux dans le groupe
-            if (mek.key?.remoteJid?.endsWith('@g.us') && !mek.key.fromMe) {
-                try {
-                    const { handleAntimentionStatus } = require('./commands/antimentionstatus');
-                    const sender = mek.key.participant || mek.key.remoteJid;
-                    const chatId = mek.key.remoteJid;
-                    await handleAntimentionStatus(XeonBotInc, chatId, sender, mek);
-                } catch(e) { /* non critique */ }
-            }
-            // In private mode, only block non-group messages (allow groups for moderation)
-            // Note: XeonBotInc.public is not synced, so we check mode in main.js instead
-            // This check is kept for backward compatibility but mainly blocks DMs
-            if (!XeonBotInc.public && !mek.key.fromMe && chatUpdate.type === 'notify') {
-                const isGroup = mek.key?.remoteJid?.endsWith('@g.us')
-                if (!isGroup) return // Block DMs in private mode, but allow group messages
-            }
-            if (mek.key.id.startsWith('BAE5') && mek.key.id.length === 16) return
-
-            // ── Chaînes WhatsApp : traiter les messages newsletter ──
-            const isChannel = mek.key?.remoteJid?.endsWith('@newsletter');
-            if (isChannel) {
-                // Forcer fromMe=true pour que le bot traite comme commande proprio
-                mek.key.fromMe = true;
-            }
-
-            // Clear message retry cache to prevent memory bloat
-            if (XeonBotInc?.msgRetryCounterCache) {
-                XeonBotInc.msgRetryCounterCache.clear()
-            }
-
-            try {
-                await handleMessages(XeonBotInc, chatUpdate, true)
-            } catch (err) {
-                // Erreur silencieuse — on log seulement dans la console, pas dans WhatsApp
-                console.error("Error in handleMessages:", err.message || err)
-            }
-        } catch (err) {
-            console.error("Error in messages.upsert:", err)
+        const dataPath = path.join(__dirname, '../data/userGroupData.json');
+        if (!fs.existsSync(dataPath)) {
+            // Create the file with default structure if it doesn't exist
+            const defaultData = {
+                antibadword: {},
+                antilink: {},
+                welcome: {},
+                goodbye: {},
+                chatbot: {},
+                warnings: {},
+                sudo: []
+            };
+            fs.writeFileSync(dataPath, JSON.stringify(defaultData, null, 2));
+            return defaultData;
         }
-    })
-
-    // Add these event handlers for better functionality
-    XeonBotInc.decodeJid = (jid) => {
-        if (!jid) return jid
-        if (/:\d+@/gi.test(jid)) {
-            let decode = jidDecode(jid) || {}
-            return decode.user && decode.server && decode.user + '@' + decode.server || jid
-        } else return jid
-    }
-
-    XeonBotInc.ev.on('contacts.update', update => {
-        for (let contact of update) {
-            let id = XeonBotInc.decodeJid(contact.id)
-            if (store && store.contacts) store.contacts[id] = { id, name: contact.notify }
-        }
-    })
-
-    XeonBotInc.getName = (jid, withoutContact = false) => {
-        id = XeonBotInc.decodeJid(jid)
-        withoutContact = XeonBotInc.withoutContact || withoutContact
-        let v
-        if (id.endsWith("@g.us")) return new Promise(async (resolve) => {
-            v = store.contacts[id] || {}
-            if (!(v.name || v.subject)) v = XeonBotInc.groupMetadata(id) || {}
-            resolve(v.name || v.subject || PhoneNumber('+' + id.replace('@s.whatsapp.net', '')).getNumber('international'))
-        })
-        else v = id === '0@s.whatsapp.net' ? {
-            id,
-            name: 'WhatsApp'
-        } : id === XeonBotInc.decodeJid(XeonBotInc.user.id) ?
-            XeonBotInc.user :
-            (store.contacts[id] || {})
-        return (withoutContact ? '' : v.name) || v.subject || v.verifiedName || PhoneNumber('+' + jid.replace('@s.whatsapp.net', '')).getNumber('international')
-    }
-
-    XeonBotInc.public = true
-
-    XeonBotInc.serializeM = (m) => smsg(XeonBotInc, m, store)
-
-    // Handle pairing code
-    if (pairingCode && !XeonBotInc.authState.creds.registered) {
-        if (useMobile) throw new Error('Cannot use pairing code with mobile api')
-
-        let phoneNumber
-        if (!!global.phoneNumber) {
-            phoneNumber = global.phoneNumber
-        } else {
-            phoneNumber = await question(chalk.bgBlack(chalk.greenBright(`METTEZ VOTRE NUMÉRO ICI\nFORMAT: NUMERO (SANS + NI ESPACES) : `)))
-        }
-
-        // Clean the phone number - remove any non-digit characters
-        phoneNumber = phoneNumber.replace(/[^0-9]/g, '')
-
-        // Validate the phone number using awesome-phonenumber
-        const pn = require('awesome-phonenumber');
-        if (!pn('+' + phoneNumber).isValid()) {
-            console.log(chalk.red('Invalid phone number. Please enter your full international number (e.g., 15551234567 for US, 447911123456 for UK, etc.) without + or spaces.'));
-            process.exit(1);
-        }
-
-        setTimeout(async () => {
-            try {
-                let code = await XeonBotInc.requestPairingCode(phoneNumber)
-                code = code?.match(/.{1,4}/g)?.join("-") || code
-                console.log(chalk.black(chalk.bgGreen(`Your Pairing Code : `)), chalk.black(chalk.white(code)))
-                console.log(chalk.yellow(`\nPlease enter this code in your WhatsApp app:\n1. Open WhatsApp\n2. Go to Settings > Linked Devices\n3. Tap "Link a Device"\n4. Enter the code shown above`))
-            } catch (error) {
-                console.error('Error requesting pairing code:', error)
-                console.log(chalk.red('Failed to get pairing code. Please check your phone number and try again.'))
-            }
-        }, 3000)
-    }
-
-    // Connection handling
-    XeonBotInc.ev.on('connection.update', async (s) => {
-        const { connection, lastDisconnect, qr } = s
-        
-        if (qr) {
-            console.log(chalk.yellow('📱 QR Code generated. Please scan with WhatsApp.'))
-        }
-        
-        if (connection === 'connecting') {
-            console.log(chalk.yellow('🔄 Connecting to WhatsApp...'))
-        }
-        
-        if (connection == "open") {
-            console.log(chalk.magenta(` `))
-            console.log(chalk.yellow(`🤩Connected to => ` + JSON.stringify(XeonBotInc.user, null, 2)))
-
-            try {
-                const botNumber = XeonBotInc.user.id.split(':')[0] + '@s.whatsapp.net';
-                const settings = require('./settings');
-                const { getCurrentPrefix } = require('./commands/setprefix');
-                const p = getCurrentPrefix();
-                const now = new Date();
-                const timeStr = now.toLocaleString('fr-FR', { dateStyle: 'full', timeStyle: 'medium' });
-                const channelInfo = {
-                    forwardingScore: 1, isForwarded: true,
-                    forwardedNewsletterMessageInfo: {
-                        newsletterJid: '120363408304719268@newsletter',
-                        newsletterName: 'CENTRAL-HEX', serverMessageId: -1
-                    }
-                };
-
-                await XeonBotInc.sendMessage(botNumber, {
-                    image: { url: './assets/central-hex.jpg' },
-                    caption: `╔══════════════════════╗\n║   💎 *CENTRAL-HEX* 💎   ║\n╠══════════════════════╣\n║   🟢 *BOT CONNECTÉ !*      ║\n╚══════════════════════╝\n\n🤖 *${settings.botName || 'CENTRAL-HEX'}* est en ligne !\n\n┌──────────────────────\n│ ⏰ *Heure    :* ${timeStr}\n│ ✅ *Statut   :* En ligne & Prêt\n│ 📦 *Version  :* v${settings.version || '2.0.0'}\n│ ⚙️ *Préfixe  :* \`${p}\`\n│ 🌍 *Mode     :* Public\n└──────────────────────\n\n💡 *Commandes rapides :*\n┌──────────────────────\n│ ⬡ \`${p}menu\`  → Menu principal\n│ ⬡ \`${p}help\`  → Aide\n│ ⬡ \`${p}ping\`  → Test vitesse\n│ ⬡ \`${p}alive\` → État du bot\n└──────────────────────\n\n📢 *Rejoins notre chaîne officielle !*\n\n> _Propulsé par 💎 *CENTRAL-HEX *_`,
-                    contextInfo: channelInfo
-                });
-            } catch (error) {
-                console.error('Error sending connection message:', error.message)
-            }
-
-            await delay(1999)
-            console.log(chalk.yellow(`\n\n                  ${chalk.bold.blue(`[ ${global.botname || 'CENTRAL-HEX'} ]`)}\n\n`))
-            console.log(chalk.cyan(`< ================================================== >`))
-            console.log(chalk.magenta(`\n${global.themeemoji || '•'} 📶 CHANNEL: https://whatsapp.com/channel/0029VbDCmVWISTkNEy1D3p3H`))
-            console.log(chalk.magenta(`${global.themeemoji || '•'} 🤖 BOT: CENTRAL-HEX`))
-            console.log(chalk.magenta(`${global.themeemoji || '•'} 👤 OWNER: ${owner}`))
-            console.log(chalk.magenta(`${global.themeemoji || '•'} CREDIT: Central-Hex`))
-            console.log(chalk.green(`${global.themeemoji || '•'} 🤖 Bot Connected Successfully! ✅`))
-            console.log(chalk.blue(`Bot Version: ${settings.version}`))
-        }
-        
-        if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut
-            const statusCode = lastDisconnect?.error?.output?.statusCode
-            
-            console.log(chalk.red(`Connection closed due to ${lastDisconnect?.error}, reconnecting ${shouldReconnect}`))
-            
-            if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-                try {
-                    rmSync('./session', { recursive: true, force: true })
-                    console.log(chalk.yellow('Session folder deleted. Please re-authenticate.'))
-                } catch (error) {
-                    console.error('Error deleting session:', error)
-                }
-                console.log(chalk.red('Session logged out. Please re-authenticate.'))
-            }
-            
-            if (shouldReconnect) {
-                console.log(chalk.yellow('Reconnecting...'))
-                await delay(5000)
-                startXeonBotInc()
-            }
-        }
-    })
-
-    // Track recently-notified callers to avoid spamming messages
-    const antiCallNotified = new Set();
-
-    // Anticall handler: block callers when enabled
-    XeonBotInc.ev.on('call', async (calls) => {
-        try {
-            const { readState: readAnticallState } = require('./commands/anticall');
-            const state = readAnticallState();
-            if (!state.enabled) return;
-            for (const call of calls) {
-                const callerJid = call.from || call.peerJid || call.chatId;
-                if (!callerJid) continue;
-                try {
-                    // First: attempt to reject the call if supported
-                    try {
-                        if (typeof XeonBotInc.rejectCall === 'function' && call.id) {
-                            await XeonBotInc.rejectCall(call.id, callerJid);
-                        } else if (typeof XeonBotInc.sendCallOfferAck === 'function' && call.id) {
-                            await XeonBotInc.sendCallOfferAck(call.id, callerJid, 'reject');
-                        }
-                    } catch {}
-
-                    // Notify the caller only once within a short window
-                    if (!antiCallNotified.has(callerJid)) {
-                        antiCallNotified.add(callerJid);
-                        setTimeout(() => antiCallNotified.delete(callerJid), 60000);
-                        await XeonBotInc.sendMessage(callerJid, { text: '📵 Anticall is enabled. Your call was rejected and you will be blocked.' });
-                    }
-                } catch {}
-                // Then: block after a short delay to ensure rejection and message are processed
-                setTimeout(async () => {
-                    try { await XeonBotInc.updateBlockStatus(callerJid, 'block'); } catch {}
-                }, 800);
-            }
-        } catch (e) {
-            // ignore
-        }
-    });
-
-    XeonBotInc.ev.on('group-participants.update', async (update) => {
-        await handleGroupParticipantUpdate(XeonBotInc, update);
-    });
-
-    XeonBotInc.ev.on('messages.upsert', async (m) => {
-        if (m.messages[0].key && m.messages[0].key.remoteJid === 'status@broadcast') {
-            await handleStatus(XeonBotInc, m);
-        }
-    });
-
-    XeonBotInc.ev.on('status.update', async (status) => {
-        await handleStatus(XeonBotInc, status);
-    });
-
-    XeonBotInc.ev.on('messages.reaction', async (status) => {
-        await handleStatus(XeonBotInc, status);
-    });
-
-    // Sauvegarder le socket globalement pour l'API
-    globalSocket = XeonBotInc;
-
-    // Capturer le QR code pour l'API
-    XeonBotInc.ev.on('connection.update', (update) => {
-        if (update.qr) {
-            qrStore['latest'] = update.qr;
-            console.log('[API] QR Code mis à jour');
-        }
-        if (update.connection === 'open') {
-            qrStore['latest'] = null; // Effacer le QR quand connecté
-        }
-    });
-
-    return XeonBotInc;
+        const data = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
+        return data;
     } catch (error) {
-        console.error('Error in startXeonBotInc:', error)
-        await delay(5000)
-        startXeonBotInc()
+        console.error('Error loading user group data:', error);
+        return {
+            antibadword: {},
+            antilink: {},
+            welcome: {},
+            goodbye: {},
+            chatbot: {},
+            warnings: {}
+        };
     }
 }
 
-
-
-// ═══════════════════════════════════════════════════════════
-// 🌐 SERVEUR API — CENTRAL-HEX Session Generator
-// ═══════════════════════════════════════════════════════════
-const http = require('http');
-const url = require('url');
-
-// Stockage temporaire des sessions et codes
-const sessionStore = {};
-const qrStore = {};
-
-function createApiServer(getSocket) {
-    const PORT = process.env.API_PORT || 3000;
-
-    const server = http.createServer(async (req, res) => {
-        // CORS headers
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-        res.setHeader('Content-Type', 'application/json');
-
-        if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
-
-        const parsed = url.parse(req.url, true);
-        const path = parsed.pathname;
-        const query = parsed.query;
-
-        try {
-            // Route: GET /pair?phone=VOTRE_NUMERO&type=short
-            if (path === '/pair') {
-                const phone = (query.phone || '').replace(/\D/g, '');
-                const type = query.type || 'short';
-
-                if (!phone || phone.length < 8) {
-                    res.writeHead(400);
-                    return res.end(JSON.stringify({ error: 'Numéro invalide' }));
-                }
-
-                const sock = getSocket();
-                if (!sock) {
-                    res.writeHead(503);
-                    return res.end(JSON.stringify({ error: 'Bot non connecté' }));
-                }
-
-                try {
-                    const jid = phone + '@s.whatsapp.net';
-                    const code = await sock.requestPairingCode(jid);
-                    // Formater le code: XXXXXXXX → XXXX-XXXX
-                    const formatted = code ? code.match(/.{1,4}/g)?.join('-') || code : null;
-
-                    if (formatted) {
-                        // Attendre la session dans le background
-                        waitForSession(sock, phone, type, jid);
-                        res.writeHead(200);
-                        res.end(JSON.stringify({ code: formatted, phone }));
-                    } else {
-                        throw new Error('Code non reçu');
-                    }
-                } catch (e) {
-                    console.error('[API/pair]', e.message);
-                    res.writeHead(500);
-                    res.end(JSON.stringify({ error: e.message }));
-                }
-            }
-
-            // Route: GET /session?phone=VOTRE_NUMERO
-            else if (path === '/session') {
-                const phone = (query.phone || '').replace(/\D/g, '');
-                const session = sessionStore[phone];
-                if (session) {
-                    res.writeHead(200);
-                    res.end(JSON.stringify({ session }));
-                } else {
-                    res.writeHead(200);
-                    res.end(JSON.stringify({ session: null, waiting: true }));
-                }
-            }
-
-            // Route: GET /qr?type=short
-            else if (path === '/qr') {
-                const qrData = qrStore['latest'];
-                if (qrData) {
-                    res.writeHead(200);
-                    res.end(JSON.stringify({ qr: qrData }));
-                } else {
-                    res.writeHead(200);
-                    res.end(JSON.stringify({ qr: null, message: 'QR pas encore disponible, réessaie dans 3s' }));
-                }
-            }
-
-            // Route: GET /qr-session
-            else if (path === '/qr-session') {
-                const session = sessionStore['qr-session'];
-                res.writeHead(200);
-                res.end(JSON.stringify({ session: session || null }));
-            }
-
-            // Route: GET /status
-            else if (path === '/status') {
-                const sock = getSocket();
-                res.writeHead(200);
-                res.end(JSON.stringify({
-                    online: !!sock,
-                    bot: 'CENTRAL-HEX',
-                    version: '2.0.0',
-                    uptime: Math.floor(process.uptime())
-                }));
-            }
-
-            else {
-                res.writeHead(404);
-                res.end(JSON.stringify({ error: 'Route non trouvée' }));
-            }
-        } catch (e) {
-            console.error('[API Error]', e);
-            res.writeHead(500);
-            res.end(JSON.stringify({ error: 'Erreur interne' }));
-        }
-    });
-
-    server.listen(PORT, () => {
-        console.log(chalk.green(`🌐 API Session Server → http://localhost:${PORT}`));
-    });
-
-    return server;
-}
-
-// Attendre que la session soit générée après le pairing
-function waitForSession(sock, phone, type, jid) {
-    // La session sera capturée via l'event creds.update
-    // On la stocke dans sessionStore[phone] quand elle est prête
-    console.log(`[API] En attente de session pour ${phone}...`);
-    
-    // Crédit timeout de 2 minutes
-    const timeout = setTimeout(() => {
-        if (!sessionStore[phone]) {
-            console.log(`[API] Timeout session pour ${phone}`);
-        }
-    }, 120000);
-
-    // Listener temporaire pour capter les creds
-    const listener = async () => {
-        try {
-            const sessionData = fs.readFileSync('./session/creds.json', 'utf8');
-            if (sessionData) {
-                let sessionId;
-                if (type === 'short') {
-                    // Encoder en base64 compact
-                    sessionId = 'centralhex~' + Buffer.from(sessionData).toString('base64').substring(0, 100);
-                } else {
-                    sessionId = sessionData;
-                }
-                sessionStore[phone] = sessionId;
-                clearTimeout(timeout);
-                console.log(`✅ [API] Session générée pour ${phone}`);
-                
-                // Envoyer la session en MP à l'utilisateur
-                await sock.sendMessage(jid, {
-                    text: `╔═════════════════════╗
-║   💎 *CENTRAL-HEX* 💎   ║
-╚═════════════════════╝
-
-✅ *Session générée !*
-
-\`\`\`${sessionId}\`\`\`
-
-> Copie et colle dans ta variable SESSION_ID 💎`
-                });
-            }
-        } catch (e) {}
-    };
-
-    // Déclencher après 5 secondes (temps de lier l'appareil)
-    setTimeout(listener, 5000);
-    setTimeout(listener, 10000);
-    setTimeout(listener, 20000);
-    setTimeout(listener, 30000);
-}
-
-// Variable globale pour accéder au socket
-let globalSocket = null;
-
-// ── Multi-sessions : une instance bot par utilisateur pairé ──
-async function startUserSession(number) {
-    const sessionDir = path.join(process.cwd(), 'sessions', number);
-    if (!fs.existsSync(sessionDir)) return;
+// Function to save user and group data to JSON file
+function saveUserGroupData(data) {
     try {
-        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        const { version } = await fetchLatestBaileysVersion();
-        const userSock = makeWASocket({
-            version,
-            logger: pino({ level: 'silent' }),
-            printQRInTerminal: false,
-            browser: Browsers.ubuntu('Chrome'),
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' })),
-            },
-            syncFullHistory: false,
-        });
-        userSock.ev.on('creds.update', saveCreds);
-        userSock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
-            if (connection === 'open') {
-                console.log(`✅ Session utilisateur connectée : +${number}`);
-            } else if (connection === 'close') {
-                const code = lastDisconnect?.error?.output?.statusCode;
-                if (code !== DisconnectReason.loggedOut) {
-                    setTimeout(() => startUserSession(number), 5000);
-                } else {
-                    fs.rmSync(sessionDir, { recursive: true, force: true });
-                }
-            }
-        });
-        userSock.ev.on('messages.upsert', async (chatUpdate) => {
-            try { await handleMessages(userSock, chatUpdate, true); } catch (e) {}
-        });
-    } catch (err) {
-        console.error(`❌ Erreur session ${number}:`, err.message);
+        const dataPath = path.join(__dirname, '../data/userGroupData.json');
+        // Ensure the directory exists
+        const dir = path.dirname(dataPath);
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        fs.writeFileSync(dataPath, JSON.stringify(data, null, 2));
+        return true;
+    } catch (error) {
+        console.error('Error saving user group data:', error);
+        return false;
     }
 }
 
-async function loadAllUserSessions() {
-    const sessionsDir = path.join(process.cwd(), 'sessions');
-    if (!fs.existsSync(sessionsDir)) return;
-    const folders = fs.readdirSync(sessionsDir);
-    for (const folder of folders) await startUserSession(folder);
+// Add these functions to your SQL helper file
+async function setAntilink(groupId, type, action) {
+    try {
+        const data = loadUserGroupData();
+        if (!data.antilink) data.antilink = {};
+        if (!data.antilink[groupId]) data.antilink[groupId] = {};
+        
+        data.antilink[groupId] = {
+            enabled: type === 'on',
+            action: action || 'delete' // Set default action to delete
+        };
+        
+        saveUserGroupData(data);
+        return true;
+    } catch (error) {
+        console.error('Error setting antilink:', error);
+        return false;
+    }
 }
 
-global.startUserSession = startUserSession;
+async function getAntilink(groupId, type) {
+    try {
+        const data = loadUserGroupData();
+        if (!data.antilink || !data.antilink[groupId]) return null;
+        
+        return type === 'on' ? data.antilink[groupId] : null;
+    } catch (error) {
+        console.error('Error getting antilink:', error);
+        return null;
+    }
+}
 
-// Démarrer le serveur API
-createApiServer(() => globalSocket);
+async function removeAntilink(groupId, type) {
+    try {
+        const data = loadUserGroupData();
+        if (data.antilink && data.antilink[groupId]) {
+            delete data.antilink[groupId];
+            saveUserGroupData(data);
+        }
+        return true;
+    } catch (error) {
+        console.error('Error removing antilink:', error);
+        return false;
+    }
+}
 
-startXeonBotInc().catch(error => {
-    console.error('Fatal error:', error)
-    process.exit(1)
-})
+// Add antitag functions
+async function setAntitag(groupId, type, action) {
+    try {
+        const data = loadUserGroupData();
+        if (!data.antitag) data.antitag = {};
+        if (!data.antitag[groupId]) data.antitag[groupId] = {};
+        
+        data.antitag[groupId] = {
+            enabled: type === 'on',
+            action: action || 'delete' // Set default action to delete
+        };
+        
+        saveUserGroupData(data);
+        return true;
+    } catch (error) {
+        console.error('Error setting antitag:', error);
+        return false;
+    }
+}
 
-loadAllUserSessions().catch(err => console.error('Erreur sessions:', err.message));
-process.on('uncaughtException', (err) => {
-    console.error('Uncaught Exception:', err)
-})
+async function getAntitag(groupId, type) {
+    try {
+        const data = loadUserGroupData();
+        if (!data.antitag || !data.antitag[groupId]) return null;
+        
+        return type === 'on' ? data.antitag[groupId] : null;
+    } catch (error) {
+        console.error('Error getting antitag:', error);
+        return null;
+    }
+}
 
-process.on('unhandledRejection', (err) => {
-    console.error('Unhandled Rejection:', err)
-})
+async function removeAntitag(groupId, type) {
+    try {
+        const data = loadUserGroupData();
+        if (data.antitag && data.antitag[groupId]) {
+            delete data.antitag[groupId];
+            saveUserGroupData(data);
+        }
+        return true;
+    } catch (error) {
+        console.error('Error removing antitag:', error);
+        return false;
+    }
+}
 
-let file = require.resolve(__filename)
-fs.watchFile(file, () => {
-    fs.unwatchFile(file)
-    console.log(chalk.redBright(`Update ${__filename}`))
-    delete require.cache[file]
-    require(file)
-})
+// Add these functions for warning system
+async function incrementWarningCount(groupId, userId) {
+    try {
+        const data = loadUserGroupData();
+        if (!data.warnings) data.warnings = {};
+        if (!data.warnings[groupId]) data.warnings[groupId] = {};
+        if (!data.warnings[groupId][userId]) data.warnings[groupId][userId] = 0;
+        
+        data.warnings[groupId][userId]++;
+        saveUserGroupData(data);
+        return data.warnings[groupId][userId];
+    } catch (error) {
+        console.error('Error incrementing warning count:', error);
+        return 0;
+    }
+}
+
+async function resetWarningCount(groupId, userId) {
+    try {
+        const data = loadUserGroupData();
+        if (data.warnings && data.warnings[groupId] && data.warnings[groupId][userId]) {
+            data.warnings[groupId][userId] = 0;
+            saveUserGroupData(data);
+        }
+        return true;
+    } catch (error) {
+        console.error('Error resetting warning count:', error);
+        return false;
+    }
+}
+
+// Add sudo check function
+async function isSudo(userId) {
+    try {
+        const data = loadUserGroupData();
+        return data.sudo && data.sudo.includes(userId);
+    } catch (error) {
+        console.error('Error checking sudo:', error);
+        return false;
+    }
+}
+
+// Manage sudo users
+async function addSudo(userJid) {
+    try {
+        const data = loadUserGroupData();
+        if (!data.sudo) data.sudo = [];
+        if (!data.sudo.includes(userJid)) {
+            data.sudo.push(userJid);
+            saveUserGroupData(data);
+        }
+        return true;
+    } catch (error) {
+        console.error('Error adding sudo:', error);
+        return false;
+    }
+}
+
+async function removeSudo(userJid) {
+    try {
+        const data = loadUserGroupData();
+        if (!data.sudo) data.sudo = [];
+        const idx = data.sudo.indexOf(userJid);
+        if (idx !== -1) {
+            data.sudo.splice(idx, 1);
+            saveUserGroupData(data);
+        }
+        return true;
+    } catch (error) {
+        console.error('Error removing sudo:', error);
+        return false;
+    }
+}
+
+async function getSudoList() {
+    try {
+        const data = loadUserGroupData();
+        return Array.isArray(data.sudo) ? data.sudo : [];
+    } catch (error) {
+        console.error('Error getting sudo list:', error);
+        return [];
+    }
+}
+
+// Add these functions
+async function addWelcome(jid, enabled, message) {
+    try {
+        const data = loadUserGroupData();
+        if (!data.welcome) data.welcome = {};
+        
+        data.welcome[jid] = {
+            enabled: enabled,
+            message: message || '╔═⚔️ WELCOME ⚔️═╗\n║ 🛡️ User: {user}\n║ 🏰 central-hex-md: {group}\n╠═══════════════╣\n║ 📜 Message:\n║ {description}\n╚═══════════════╝',
+            channelId: '120363408304719268@newsletter'
+        };
+        
+        saveUserGroupData(data);
+        return true;
+    } catch (error) {
+        console.error('Error in addWelcome:', error);
+        return false;
+    }
+}
+
+async function delWelcome(jid) {
+    try {
+        const data = loadUserGroupData();
+        if (data.welcome && data.welcome[jid]) {
+            delete data.welcome[jid];
+            saveUserGroupData(data);
+        }
+        return true;
+    } catch (error) {
+        console.error('Error in delWelcome:', error);
+        return false;
+    }
+}
+
+async function isWelcomeOn(jid) {
+    try {
+        const data = loadUserGroupData();
+        return data.welcome && data.welcome[jid] && data.welcome[jid].enabled;
+    } catch (error) {
+        console.error('Error in isWelcomeOn:', error);
+        return false;
+    }
+}
+
+async function addGoodbye(jid, enabled, message) {
+    try {
+        const data = loadUserGroupData();
+        if (!data.goodbye) data.goodbye = {};
+        
+        data.goodbye[jid] = {
+            enabled: enabled,
+            message: message || '╔═⚔️ GOODBYE ⚔️═╗\n║ 🛡️ User: {user}\n║ 🏰 central-hex-md: {group}\n╠═══════════════╣\n║ ⚰️ We will never miss you!\n╚═══════════════╝',
+            channelId: '120363408304719268@newsletter'
+        };
+        
+        saveUserGroupData(data);
+        return true;
+    } catch (error) {
+        console.error('Error in addGoodbye:', error);
+        return false;
+    }
+}
+
+async function delGoodBye(jid) {
+    try {
+        const data = loadUserGroupData();
+        if (data.goodbye && data.goodbye[jid]) {
+            delete data.goodbye[jid];
+            saveUserGroupData(data);
+        }
+        return true;
+    } catch (error) {
+        console.error('Error in delGoodBye:', error);
+        return false;
+    }
+}
+
+async function isGoodByeOn(jid) {
+    try {
+        const data = loadUserGroupData();
+        return data.goodbye && data.goodbye[jid] && data.goodbye[jid].enabled;
+    } catch (error) {
+        console.error('Error in isGoodByeOn:', error);
+        return false;
+    }
+}
+
+async function getWelcome(jid) {
+    try {
+        const data = loadUserGroupData();
+        return data.welcome && data.welcome[jid] ? data.welcome[jid].message : null;
+    } catch (error) {
+        console.error('Error in getWelcome:', error);
+        return null;
+    }
+}
+
+async function getGoodbye(jid) {
+    try {
+        const data = loadUserGroupData();
+        return data.goodbye && data.goodbye[jid] ? data.goodbye[jid].message : null;
+    } catch (error) {
+        console.error('Error in getGoodbye:', error);
+        return null;
+    }
+}
+
+// Add these functions to your existing SQL helper file
+async function setAntiBadword(groupId, type, action) {
+    try {
+        const data = loadUserGroupData();
+        if (!data.antibadword) data.antibadword = {};
+        if (!data.antibadword[groupId]) data.antibadword[groupId] = {};
+        
+        data.antibadword[groupId] = {
+            enabled: type === 'on',
+            action: action || 'delete'
+        };
+        
+        saveUserGroupData(data);
+        return true;
+    } catch (error) {
+        console.error('Error setting antibadword:', error);
+        return false;
+    }
+}
+
+async function getAntiBadword(groupId, type) {
+    try {
+        const data = loadUserGroupData();
+        //console.log('Loading antibadword config for group:', groupId);
+        //console.log('Current data:', data.antibadword);
+        
+        if (!data.antibadword || !data.antibadword[groupId]) {
+            console.log('No antibadword config found');
+            return null;
+        }
+        
+        const config = data.antibadword[groupId];
+       // console.log('Found config:', config);
+        
+        return type === 'on' ? config : null;
+    } catch (error) {
+        console.error('Error getting antibadword:', error);
+        return null;
+    }
+}
+
+async function removeAntiBadword(groupId, type) {
+    try {
+        const data = loadUserGroupData();
+        if (data.antibadword && data.antibadword[groupId]) {
+            delete data.antibadword[groupId];
+            saveUserGroupData(data);
+        }
+        return true;
+    } catch (error) {
+        console.error('Error removing antibadword:', error);
+        return false;
+    }
+}
+
+async function setChatbot(groupId, enabled) {
+    try {
+        const data = loadUserGroupData();
+        if (!data.chatbot) data.chatbot = {};
+        
+        data.chatbot[groupId] = {
+            enabled: enabled
+        };
+        
+        saveUserGroupData(data);
+        return true;
+    } catch (error) {
+        console.error('Error setting chatbot:', error);
+        return false;
+    }
+}
+
+async function getChatbot(groupId) {
+    try {
+        const data = loadUserGroupData();
+        return data.chatbot?.[groupId] || null;
+    } catch (error) {
+        console.error('Error getting chatbot:', error);
+        return null;
+    }
+}
+
+async function removeChatbot(groupId) {
+    try {
+        const data = loadUserGroupData();
+        if (data.chatbot && data.chatbot[groupId]) {
+            delete data.chatbot[groupId];
+            saveUserGroupData(data);
+        }
+        return true;
+    } catch (error) {
+        console.error('Error removing chatbot:', error);
+        return false;
+    }
+}
+
+module.exports = {
+    // ... existing exports
+    setAntilink,
+    getAntilink,
+    removeAntilink,
+    setAntitag,
+    getAntitag,
+    removeAntitag,
+    incrementWarningCount,
+    resetWarningCount,
+    isSudo,
+    addSudo,
+    removeSudo,
+    getSudoList,
+    addWelcome,
+    delWelcome,
+    isWelcomeOn,
+    getWelcome,
+    addGoodbye,
+    delGoodBye,
+    isGoodByeOn,
+    getGoodbye,
+    setAntiBadword,
+    getAntiBadword,
+    removeAntiBadword,
+    setChatbot,
+    getChatbot,
+    removeChatbot,
+}; 
