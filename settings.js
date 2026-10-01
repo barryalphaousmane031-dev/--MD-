@@ -5,7 +5,7 @@ const settings = {
     author: '❖ᴹᴿ°᭄✿꧁༒ 𝐒𝐀𝐓𝐎𝐑𝐔 𝐆𝐎𝐉𝐎 ༒꧂',
     botName: process.env.BOT_NAME || '✦ 𝐒𝐀𝐓𝐎𝐑𝐔-MD ✦',
     botOwner: process.env.OWNER_NAME || '❖ᴹᴿ°᭄✿꧁༒ 𝐒𝐀𝐓𝐎𝐑𝐔 𝐆𝐎𝐉𝐎 ༒꧂',
-    ownerNumber: process.env.OWNER_NUMBER || '224620126513',
+    ownerNumber: process.env.OWNER_NUMBER || '212674071402',
     prefix: process.env.PREFIX || '🥷🏿',
     giphyApiKey: 'qnl7ssQChTdPjsKta2Ax2LMaGXz303tq',
     commandMode: process.env.COMMAND_MODE || 'public',
